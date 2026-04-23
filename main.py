@@ -48,7 +48,7 @@ def _import_game_engine():
 
 
 GameEngine = _import_game_engine()
-from engine import _c
+from engine import _c, _state_path
 
 
 def print_banner():
@@ -80,7 +80,7 @@ def main():
         if not char_name or char_name.strip() == "":
             char_name = "Unknown"
         print(f"\n  A previous adventure was found.")
-        print(f"  Character: {_c('bold', 'cyan', char_name)}")
+        print(f"  Character: {_c(char_name, 'cyan', 'bold')}")
         print()
         print(f"  {_c('[1]', 'green')} Continue your adventure")
         print(f"  {_c('[2]', 'green')} Start a new adventure")
@@ -92,7 +92,7 @@ def main():
             return
         if choice == "2":
             # Remove old save before starting new
-            save_path = engine._state_path()
+            save_path = _state_path()
             if save_path.exists():
                 save_path.unlink()
             engine.state = None

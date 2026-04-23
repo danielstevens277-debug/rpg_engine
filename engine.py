@@ -594,7 +594,7 @@ class GameEngine:
 
             if player_input.lower() in ("newgame", "new game"):
                 if input("  Are you sure? This will start a brand new adventure. (yes/no): ").strip().lower() in ("yes", "y"):
-                    save_path = self._state_path()
+                    save_path = _state_path()
                     if save_path.exists():
                         save_path.unlink()
                     self.state = None
