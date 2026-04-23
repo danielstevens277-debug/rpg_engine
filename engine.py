@@ -392,7 +392,11 @@ class GameEngine:
             if "character" not in self.state:
                 self.state["character"] = {}
             print(f"\n  World: {self.state.get('world_name', 'the Known Realm')}")
-            print(f"  Character: {self.state.get('character', {}).get('name', 'Unknown')}")
+            char = self.state.get('character', {})
+            char_name = char.get('name', '').strip() if char else ''
+            if not char_name:
+                char_name = 'Unknown'
+            print(f"  Character: {char_name}")
 
     def save_game(self):
         """Save the current game state to JSON."""
@@ -444,7 +448,7 @@ class GameEngine:
         # Wait for player input
         while True:
             try:
-                player_input = input("  " + _c("[?]", "yellow") + _c(" Your words... (type 'quit' to exit)", "dim"))
+                player_input = input("  " + _c("[?]", "yellow") + _c(" Your words... (type 'quit' to exit)", "dim") + _c(">", "green") + " ")
                 print()
             except (EOFError, KeyboardInterrupt):
                 print("\n  The adventure pauses...\n")
@@ -558,7 +562,7 @@ class GameEngine:
 
         while True:
             try:
-                player_input = input("  " + _c("[?]", "yellow") + _c(" What do you do?", "dim"))
+                player_input = input("  " + _c("[?]", "yellow") + _c(" What do you do?", "dim") + _c(">", "green") + " ")
             except (EOFError, KeyboardInterrupt):
                 print("\n\n  The adventure pauses as you step away...")
                 print("  Your journey is saved. Until next time.\n")
@@ -586,6 +590,17 @@ class GameEngine:
 
             if player_input.lower() in ("help", "?", "h"):
                 self._show_help()
+                continue
+
+            if player_input.lower() in ("newgame", "new game"):
+                if input("  Are you sure? This will start a brand new adventure. (yes/no): ").strip().lower() in ("yes", "y"):
+                    save_path = self._state_path()
+                    if save_path.exists():
+                        save_path.unlink()
+                    self.state = None
+                    print("  A new world awaits. Let us begin.\n")
+                    self.create_character()
+                    print()
                 continue
 
             # Send to LLM
@@ -623,9 +638,12 @@ class GameEngine:
         print(_c("  |", "cyan"))
 
         char = self.state.get("character", {})
-        print(_c("  |  Name:     " + str(char.get("name", "Unknown")), "cyan"))
-        print(_c("  |  Race:     " + str(char.get("race", "Unknown")), "cyan"))
-        print(_c("  |  Class:    " + str(char.get("class", "Unknown")), "cyan"))
+        name = char.get("name", "").strip() if char else ""
+        race = char.get("race", "").strip() if char else ""
+        cls = char.get("class", "").strip() if char else ""
+        print(_c("  |  Name:     " + (name or "Unknown"), "cyan"))
+        print(_c("  |  Race:     " + (race or "Unknown"), "cyan"))
+        print(_c("  |  Class:    " + (cls or "Unknown"), "cyan"))
         print(_c("  |", "cyan"))
 
         # Count messages to estimate turns
@@ -647,6 +665,7 @@ class GameEngine:
         print(f"  {_c('quit', 'yellow')}      - Save and exit the adventure")
         print(f"  {_c('save', 'yellow')}     - Manually save the current game")
         print(f"  {_c('status', 'yellow')} - Show character and game status")
+        print(f"  {_c('newgame', 'yellow')}  - Start a brand new adventure")
         print(f"  {_c('help', 'yellow')}   - Show this help message")
         print()
         print(f"  {_c('Tip:', 'bold')} Everything else is roleplay! Describe actions,")
