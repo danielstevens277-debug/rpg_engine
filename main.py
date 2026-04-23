@@ -32,10 +32,16 @@ def _import_game_engine():
     engine_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine.py")
     if os.path.isfile(engine_path):
         import importlib.util
-        spec = importlib.util.spec_from_file_location("engine", engine_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.GameEngine
+        try:
+            spec = importlib.util.spec_from_file_location("engine", engine_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not create module spec for {engine_path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.GameEngine
+        except Exception as e:
+            print(f"  Failed to load engine module: {e}")
+            sys.exit(1)
 
     print("  Could not find engine.py. Make sure you're running from the rpg_engine/ directory.")
     sys.exit(1)

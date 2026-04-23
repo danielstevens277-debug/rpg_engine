@@ -117,6 +117,8 @@ def _call_llm(messages, temperature=0.85, max_tokens=2048):
             if content is not None:
                 return content
         return "  The Oracle is silent. Please try again."
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as e:
         error_msg = str(e).lower()
         if "connection" in error_msg or "timeout" in error_msg:
@@ -200,6 +202,8 @@ def _call_anthropic(config, messages, temperature, max_tokens):
             if hasattr(block, "text"):
                 return block.text
         return "  The Oracle is silent. Please try again."
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as e:
         return f"  The Oracle stumbles: {str(e)[:200]}"
 
