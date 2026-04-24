@@ -81,7 +81,8 @@ def _get_api_config():
 def _call_llm(messages, temperature=0.85, max_tokens=2048):
     """
     Call the LLM API. Supports OpenAI-compatible endpoints and Anthropic.
-    Returns the assistant's text response.
+    Returns a tuple of (response_text, reasoning_content) where reasoning_content
+    may be None if the model did not produce any.
     """
     config = _get_api_config()
 
@@ -113,10 +114,13 @@ def _call_llm(messages, temperature=0.85, max_tokens=2048):
         )
         choices = getattr(response, "choices", None)
         if choices:
-            content = getattr(getattr(choices[0], "message", None), "content", None)
+            message = getattr(choices[0], "message", None)
+            content = getattr(message, "content", None)
+            # Extract reasoning_content from reasoning models (o1, o3, etc.)
+            reasoning = getattr(message, "reasoning_content", None)
             if content is not None:
-                return content
-        return "  The Oracle is silent. Please try again."
+                return content, reasoning
+        return "  The Oracle is silent. Please try again.", None
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
@@ -197,11 +201,16 @@ def _call_anthropic(config, messages, temperature, max_tokens):
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        # Iterate content blocks to find the first text block
+        # Iterate content blocks to find the first text block and any thinking blocks
+        response_text = None
+        thinking = None
         for block in response.content:
             if hasattr(block, "text"):
-                return block.text
-        return "  The Oracle is silent. Please try again."
+                if block.type == "thinking":
+                    thinking = block.text
+                elif response_text is None:
+                    response_text = block.text
+        return response_text, thinking
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
@@ -435,7 +444,7 @@ class GameEngine:
         ]
 
         try:
-            dm_questions = _call_llm(char_prompt, temperature=0.9, max_tokens=512)
+            dm_questions, dm_reasoning = _call_llm(char_prompt, temperature=0.9, max_tokens=512)
         except KeyboardInterrupt:
             print("\n  The Oracle's voice fades as you step away...\n")
             self.save_game()
@@ -475,7 +484,7 @@ class GameEngine:
                 {"role": "user", "content": f"CHARACTER_CREATION_RESPONSE: {player_input}"},
             ]
             try:
-                response = _call_llm(char_messages, temperature=0.85, max_tokens=2048)
+                response, char_reasoning = _call_llm(char_messages, temperature=0.85, max_tokens=2048)
             except KeyboardInterrupt:
                 print("\n  The Oracle's voice fades as you step away...\n")
                 self.save_game()
@@ -488,6 +497,8 @@ class GameEngine:
                 {"role": "user", "content": player_input},
                 {"role": "assistant", "content": response},
             ]
+            if char_reasoning:
+                self.state["last_reasoning"] = char_reasoning
 
             print(f"  {_c('Dungeon Master', 'bold', 'cyan')}: {response}\n")
 
@@ -607,7 +618,7 @@ class GameEngine:
             self.messages.append({"role": "user", "content": player_input})
 
             try:
-                response = _call_llm(self.messages, temperature=0.85, max_tokens=2048)
+                response, reasoning = _call_llm(self.messages, temperature=0.85, max_tokens=2048)
             except KeyboardInterrupt:
                 print("\n  The Oracle's voice fades as you step away...\n")
                 # Remove the user message that had no response
@@ -616,6 +627,8 @@ class GameEngine:
                 continue
 
             self.messages.append({"role": "assistant", "content": response})
+            if reasoning:
+                self.state["last_reasoning"] = reasoning
 
             # Keep messages manageable - remove oldest user messages beyond system prompt
             # but keep the last 30 messages for context
@@ -650,6 +663,13 @@ class GameEngine:
         turn_count = sum(1 for m in self.messages if m.get("role") == "user")
         print(_c("  |  Turns:    " + str(turn_count), "cyan"))
         print(_c("  |", "cyan"))
+
+        # Show reasoning/thinking content if available
+        reasoning = self.state.get("last_reasoning")
+        if reasoning:
+            display_reasoning = reasoning if len(reasoning) <= 200 else reasoning[:200] + "..."
+            print(_c("  |  Thinking: " + _c(display_reasoning.strip()[:180], "dim"), "cyan"))
+            print(_c("  |", "cyan"))
 
         if self.state.get("_saved_at"):
             print(_c("  |  Saved:    " + self.state["_saved_at"][:19], "cyan"))
