@@ -128,16 +128,19 @@ def _call_llm(messages, temperature=0.85, max_tokens=2048):
         if "connection" in error_msg or "timeout" in error_msg:
             return (
                 "  The connection to the Oracle has been lost.\n"
-                "     Please check your internet connection and try again."
+                "     Please check your internet connection and try again.",
+                None,
             )
         elif "rate" in error_msg or "limit" in error_msg:
             return (
-                "  The Oracle is speaking slowly... Please wait a moment."
+                "  The Oracle is speaking slowly... Please wait a moment.",
+                None,
             )
         else:
             return (
                 f"  The Oracle stumbles: {str(e)[:200]}\n"
-                "     Please try again."
+                "     Please try again.",
+                None,
             )
 
 
@@ -214,7 +217,7 @@ def _call_anthropic(config, messages, temperature, max_tokens):
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
-        return f"  The Oracle stumbles: {str(e)[:200]}"
+        return f"  The Oracle stumbles: {str(e)[:200]}", None
 
 
 # ---------------------------------------------------------------------------
