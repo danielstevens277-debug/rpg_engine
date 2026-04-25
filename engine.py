@@ -191,7 +191,8 @@ def _get_max_tokens(client, model_name):
     return None
 
 
-def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
+def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True,
+              thinking_end=None, thinking_thread=None):
     """
     Call the LLM API. Supports OpenAI-compatible endpoints and Anthropic.
     Streams tokens to stdout in real-time when stream=True.
@@ -201,7 +202,8 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
     config = _get_api_config()
 
     if config["provider"] == "anthropic":
-        return _call_anthropic(config, messages, temperature, max_tokens, stream=stream)
+        return _call_anthropic(config, messages, temperature, max_tokens, stream=stream,
+                               thinking_end=thinking_end, thinking_thread=thinking_thread)
 
     # Default: OpenAI-compatible API
     try:
@@ -234,9 +236,9 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
         }
 
         if stream:
-            return _stream_openai(client, kwargs)
+            return _stream_openai(client, kwargs, thinking_end, thinking_thread)
         else:
-            return _nonstream_openai(client, kwargs)
+            return _nonstream_openai(client, kwargs, thinking_end, thinking_thread)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
@@ -267,7 +269,7 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
             )
 
 
-def _nonstream_openai(client, kwargs):
+def _nonstream_openai(client, kwargs, thinking_end, thinking_thread):
     """Non-streaming OpenAI call. Returns (content, reasoning, thinking_end, thinking_thread)."""
     response = client.chat.completions.create(**kwargs)
     choices = getattr(response, "choices", None)
@@ -284,7 +286,7 @@ def _nonstream_openai(client, kwargs):
     return "  The Oracle is silent. Please try again.", None, thinking_end, thinking_thread
 
 
-def _stream_openai(client, kwargs):
+def _stream_openai(client, kwargs, thinking_end, thinking_thread):
     """
     Streaming OpenAI call. Prints tokens to stdout as they arrive.
     Thinking content appears in a separate dim block; output in its own block.
@@ -345,11 +347,12 @@ def _get_anthropic_max_tokens(api_key, model_name, base_url=None):
     return None
 
 
-def _call_anthropic(config, messages, temperature, max_tokens, stream=True):
+def _call_anthropic(config, messages, temperature, max_tokens, stream=True,
+                    thinking_end=None, thinking_thread=None):
     """
     Call Anthropic's Claude API.
     Streams tokens to stdout in real-time when stream=True.
-    Returns a tuple of (response_text, thinking_content).
+    Returns a tuple of (response_text, thinking_content, thinking_end, thinking_thread).
     """
     try:
         import anthropic
@@ -416,10 +419,12 @@ def _call_anthropic(config, messages, temperature, max_tokens, stream=True):
 
         if stream:
             return _stream_anthropic(client, system_msg, merged, temperature,
-                                     max_tokens, thinking_budget, model_name)
+                                     max_tokens, thinking_budget, model_name,
+                                     thinking_end, thinking_thread)
         else:
             return _nonstream_anthropic(client, system_msg, merged, temperature,
-                                        max_tokens, thinking_budget, model_name)
+                                        max_tokens, thinking_budget, model_name,
+                                        thinking_end, thinking_thread)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
@@ -428,7 +433,7 @@ def _call_anthropic(config, messages, temperature, max_tokens, stream=True):
 
 
 def _nonstream_anthropic(client, system_msg, merged, temperature, max_tokens,
-                         thinking_budget, model_name):
+                         thinking_budget, model_name, thinking_end, thinking_thread):
     """Non-streaming Anthropic call. Returns (text, thinking, thinking_end, thinking_thread)."""
     response = client.messages.create(
         model=model_name,
@@ -455,7 +460,7 @@ def _nonstream_anthropic(client, system_msg, merged, temperature, max_tokens,
 
 
 def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
-                      thinking_budget, model_name):
+                      thinking_budget, model_name, thinking_end, thinking_thread):
     """
     Streaming Anthropic call. Prints tokens to stdout as they arrive.
     Thinking content appears in a separate dim block; output in its own block.
@@ -729,7 +734,8 @@ class GameEngine:
 
         thinking_end, thinking_thread = _show_thinking(duration=None)
         try:
-            dm_questions, dm_reasoning, thinking_end, thinking_thread = _call_llm(char_prompt, temperature=1, max_tokens=4096)
+            dm_questions, dm_reasoning, thinking_end, thinking_thread = _call_llm(char_prompt, temperature=1, max_tokens=4096,
+                                                                                   thinking_end=thinking_end, thinking_thread=thinking_thread)
         except KeyboardInterrupt:
             _stop_thinking(thinking_end, thinking_thread)
             print("\n  The Oracle's voice fades as you step away...\n")
@@ -769,7 +775,8 @@ class GameEngine:
             ]
             thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
-                response, char_reasoning, thinking_end, thinking_thread = _call_llm(char_messages, temperature=1, max_tokens=16384)
+                response, char_reasoning, thinking_end, thinking_thread = _call_llm(char_messages, temperature=1, max_tokens=16384,
+                                                                                      thinking_end=thinking_end, thinking_thread=thinking_thread)
             except KeyboardInterrupt:
                 _stop_thinking(thinking_end, thinking_thread)
                 print("\n  The Oracle's voice fades as you step away...\n")
@@ -904,7 +911,8 @@ class GameEngine:
 
             thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
-                response, reasoning, thinking_end, thinking_thread = _call_llm(self.messages, temperature=1, max_tokens=16384)
+                response, reasoning, thinking_end, thinking_thread = _call_llm(self.messages, temperature=1, max_tokens=16384,
+                                                                                 thinking_end=thinking_end, thinking_thread=thinking_thread)
             except KeyboardInterrupt:
                 _stop_thinking(thinking_end, thinking_thread)
                 print("\n  The Oracle's voice fades as you step away...\n")
