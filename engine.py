@@ -48,8 +48,16 @@ def _print_sep(char="=", color="cyan", width=62):
 def _show_thinking(duration: float = 1.5):
     """
     Show a thematic "Dungeon Master is thinking" indicator.
-    The dots animate in sequence, then fade out as if the Oracle
-    is pondering the player's words.
+    The dots animate in sequence as if the Oracle is pondering.
+
+    Parameters:
+        duration: Seconds to show the animation. Pass None to run
+                  indefinitely until stop_thinking() is called.
+
+    Returns:
+        A tuple of (end_event, thread). Call end_event.set() and
+        thread.join() to stop the animation, or pass duration=None
+        and stop manually after the work is done.
     """
     sys.stdout.write("  ")
     sys.stdout.flush()
@@ -60,9 +68,14 @@ def _show_thinking(duration: float = 1.5):
     def _animate():
         elapsed = 0.0
         dot_idx = 0
-        while not end_event.is_set() and elapsed < duration:
-            time.sleep(0.4)
-            elapsed += 0.4
+        while not end_event.is_set():
+            if duration is not None:
+                time.sleep(0.4)
+                elapsed += 0.4
+                if elapsed >= duration:
+                    break
+            else:
+                time.sleep(0.4)
             sys.stdout.write(f"\r  {_c('The Oracle ponders', 'dim')}  {dots[dot_idx]}")
             sys.stdout.flush()
             dot_idx = (dot_idx + 1) % len(dots)
@@ -70,12 +83,22 @@ def _show_thinking(duration: float = 1.5):
     thread = Thread(target=_animate, daemon=True)
     thread.start()
 
-    # Wait for the full duration
-    time.sleep(duration)
+    # Wait for the full duration if finite
+    if duration is not None:
+        time.sleep(duration)
+        end_event.set()
+        thread.join(timeout=0.5)
+        # Clear the thinking line
+        sys.stdout.write("\r" + " " * 44 + "\r")
+        sys.stdout.flush()
+
+    return end_event, thread
+
+
+def _stop_thinking(end_event, thread):
+    """Stop a thinking animation started with _show_thinking(duration=None)."""
     end_event.set()
     thread.join(timeout=0.5)
-
-    # Clear the thinking line
     sys.stdout.write("\r" + " " * 44 + "\r")
     sys.stdout.flush()
 
@@ -643,13 +666,15 @@ class GameEngine:
             {"role": "user", "content": "Please begin character creation."},
         ]
 
-        _show_thinking(duration=2.0)
+        thinking_end, thinking_thread = _show_thinking(duration=None)
         try:
             dm_questions, dm_reasoning = _call_llm(char_prompt, temperature=1, max_tokens=4096)
         except KeyboardInterrupt:
+            _stop_thinking(thinking_end, thinking_thread)
             print("\n  The Oracle's voice fades as you step away...\n")
             self.save_game()
             return False
+        _stop_thinking(thinking_end, thinking_thread)
         # Store the DM's questions in conversation history
         self.messages.append({"role": "assistant", "content": dm_questions})
 
@@ -682,13 +707,15 @@ class GameEngine:
                 {"role": "assistant", "content": dm_questions},
                 {"role": "user", "content": f"CHARACTER_CREATION_RESPONSE: {player_input}"},
             ]
-            _show_thinking(duration=2.0)
+            thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
                 response, char_reasoning = _call_llm(char_messages, temperature=1, max_tokens=16384)
             except KeyboardInterrupt:
+                _stop_thinking(thinking_end, thinking_thread)
                 print("\n  The Oracle's voice fades as you step away...\n")
                 self.save_game()
                 return False
+            _stop_thinking(thinking_end, thinking_thread)
 
             # Update messages to include the full character creation exchange
             self.messages = [
@@ -815,15 +842,17 @@ class GameEngine:
             # Send to LLM
             self.messages.append({"role": "user", "content": player_input})
 
-            _show_thinking(duration=2.0)
+            thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
                 response, reasoning = _call_llm(self.messages, temperature=1, max_tokens=16384)
             except KeyboardInterrupt:
+                _stop_thinking(thinking_end, thinking_thread)
                 print("\n  The Oracle's voice fades as you step away...\n")
                 # Remove the user message that had no response
                 self.messages.pop()
                 self.save_game()
                 continue
+            _stop_thinking(thinking_end, thinking_thread)
 
             self.messages.append({"role": "assistant", "content": response})
             if reasoning:
