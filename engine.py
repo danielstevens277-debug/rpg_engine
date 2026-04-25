@@ -11,8 +11,10 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
+from threading import Event, Thread
 
 # ---------------------------------------------------------------------------
 # Terminal helpers (no external deps required)
@@ -41,6 +43,41 @@ def _c(text, *colors):
 
 def _print_sep(char="=", color="cyan", width=62):
     print(_c(char * width, color))
+
+
+def _show_thinking(duration: float = 1.5):
+    """
+    Show a thematic "Dungeon Master is thinking" indicator.
+    The dots animate in sequence, then fade out as if the Oracle
+    is pondering the player's words.
+    """
+    sys.stdout.write("  ")
+    sys.stdout.flush()
+
+    dots = [".", "..", "..."]
+    end_event = Event()
+
+    def _animate():
+        elapsed = 0.0
+        dot_idx = 0
+        while not end_event.is_set() and elapsed < duration:
+            time.sleep(0.4)
+            elapsed += 0.4
+            sys.stdout.write(f"\r  {_c('The Oracle ponders', 'dim')}  {dots[dot_idx]}")
+            sys.stdout.flush()
+            dot_idx = (dot_idx + 1) % len(dots)
+
+    thread = Thread(target=_animate, daemon=True)
+    thread.start()
+
+    # Wait for the full duration
+    time.sleep(duration)
+    end_event.set()
+    thread.join(timeout=0.5)
+
+    # Clear the thinking line
+    sys.stdout.write("\r" + " " * 44 + "\r")
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -78,16 +115,36 @@ def _get_api_config():
     }
 
 
-def _call_llm(messages, temperature=0.85, max_tokens=2048):
+def _get_max_tokens(client, model_name):
+    """Query the API for the model's context length and return a safe max_tokens budget."""
+    try:
+        # Try to fetch model metadata
+        model_info = client.models.retrieve(model=model_name)
+        ctx = None
+        for attr in ("context_length", "max_input_tokens", "max_context_tokens"):
+            ctx = getattr(model_info, attr, None)
+            if ctx:
+                break
+        if ctx and isinstance(ctx, (int, float)) and ctx > 0:
+            # Leave 4k headroom for system prompt + response
+            return int(min(ctx * 0.95, ctx - 4096))
+    except Exception:
+        pass
+    # Fallback: use the caller's default
+    return None
+
+
+def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
     """
     Call the LLM API. Supports OpenAI-compatible endpoints and Anthropic.
+    Streams tokens to stdout in real-time when stream=True.
     Returns a tuple of (response_text, reasoning_content) where reasoning_content
     may be None if the model did not produce any.
     """
     config = _get_api_config()
 
     if config["provider"] == "anthropic":
-        return _call_anthropic(config, messages, temperature, max_tokens)
+        return _call_anthropic(config, messages, temperature, max_tokens, stream=stream)
 
     # Default: OpenAI-compatible API
     try:
@@ -106,21 +163,23 @@ def _call_llm(messages, temperature=0.85, max_tokens=2048):
 
         client = openai.OpenAI(**kwargs)
 
-        response = client.chat.completions.create(
-            model=config["model"],
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        choices = getattr(response, "choices", None)
-        if choices:
-            message = getattr(choices[0], "message", None)
-            content = getattr(message, "content", None)
-            # Extract reasoning_content from reasoning models (o1, o3, etc.)
-            reasoning = getattr(message, "reasoning_content", None)
-            if content is not None:
-                return content, reasoning
-        return "  The Oracle is silent. Please try again.", None
+        # Query the endpoint for the model's actual context length
+        effective_max = _get_max_tokens(client, config["model"])
+        if effective_max is not None:
+            max_tokens = effective_max
+
+        kwargs = {
+            "model": config["model"],
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+
+        if stream:
+            return _stream_openai(client, kwargs)
+        else:
+            return _nonstream_openai(client, kwargs)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
@@ -144,8 +203,81 @@ def _call_llm(messages, temperature=0.85, max_tokens=2048):
             )
 
 
-def _call_anthropic(config, messages, temperature, max_tokens):
-    """Call Anthropic's Claude API."""
+def _nonstream_openai(client, kwargs):
+    """Non-streaming OpenAI call. Returns (content, reasoning)."""
+    response = client.chat.completions.create(**kwargs)
+    choices = getattr(response, "choices", None)
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        reasoning = getattr(message, "reasoning_content", None)
+        if content is not None:
+            return content, reasoning
+    return "  The Oracle is silent. Please try again.", None
+
+
+def _stream_openai(client, kwargs):
+    """
+    Streaming OpenAI call. Prints tokens to stdout as they arrive.
+    Reasoning tokens are shown in dim color; normal tokens are shown normally.
+    Returns (full_content, full_reasoning).
+    """
+    stream = client.chat.completions.create(**kwargs)
+    full_content = ""
+    full_reasoning = ""
+
+    try:
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if not delta:
+                continue
+
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                full_reasoning += reasoning
+                sys.stdout.write(_c(reasoning, "dim"))
+                sys.stdout.flush()
+
+            content = getattr(delta, "content", None)
+            if content:
+                full_content += content
+                sys.stdout.write(content)
+                sys.stdout.flush()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        pass
+
+    return full_content, full_reasoning if full_reasoning else None
+
+
+def _get_anthropic_max_tokens(api_key, model_name, base_url=None):
+    """Query Anthropic API for the model's context length."""
+    try:
+        import httpx
+        url = (base_url or "https://api.anthropic.com") + f"/v1/messages/models/{model_name}"
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        resp = httpx.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            for attr in ("context_window", "context_length", "max_input_tokens"):
+                ctx = data.get(attr)
+                if ctx and isinstance(ctx, (int, float)) and ctx > 0:
+                    return int(min(ctx * 0.95, ctx - 4096))
+    except Exception:
+        pass
+    return None
+
+
+def _call_anthropic(config, messages, temperature, max_tokens, stream=True):
+    """
+    Call Anthropic's Claude API.
+    Streams tokens to stdout in real-time when stream=True.
+    Returns a tuple of (response_text, thinking_content).
+    """
     try:
         import anthropic
     except ImportError:
@@ -197,27 +329,92 @@ def _call_anthropic(config, messages, temperature, max_tokens):
             kwargs.pop("base_url", None)
             client = anthropic.Anthropic(**kwargs)
 
-        response = client.messages.create(
-            model=config["model"] or "claude-sonnet-4-20250514",
-            system=system_msg or "You are a Dungeon Master for a text RPG.",
-            messages=merged,
-            temperature=temperature,
-            max_tokens=max_tokens,
+        # Query the endpoint for the model's actual context length
+        effective_max = _get_anthropic_max_tokens(
+            config["api_key"], config["model"] or "claude-sonnet-4-20250514",
+            config.get("base_url")
         )
-        # Iterate content blocks to find the first text block and any thinking blocks
-        response_text = None
-        thinking = None
-        for block in response.content:
-            if hasattr(block, "text"):
-                if block.type == "thinking":
-                    thinking = block.text
-                elif response_text is None:
-                    response_text = block.text
-        return response_text, thinking
+        if effective_max is not None:
+            max_tokens = effective_max
+
+        # Enable thinking with a budget proportional to the context window
+        thinking_budget = max(8192, min(max_tokens // 2, 131072))
+        model_name = config["model"] or "claude-sonnet-4-20250514"
+
+        if stream:
+            return _stream_anthropic(client, system_msg, merged, temperature,
+                                     max_tokens, thinking_budget, model_name)
+        else:
+            return _nonstream_anthropic(client, system_msg, merged, temperature,
+                                        max_tokens, thinking_budget, model_name)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
         return f"  The Oracle stumbles: {str(e)[:200]}", None
+
+
+def _nonstream_anthropic(client, system_msg, merged, temperature, max_tokens,
+                         thinking_budget, model_name):
+    """Non-streaming Anthropic call. Returns (text, thinking)."""
+    response = client.messages.create(
+        model=model_name,
+        system=system_msg or "You are a Dungeon Master for a text RPG.",
+        messages=merged,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking={"type": "enabled", "budget_tokens": thinking_budget},
+    )
+    response_text = None
+    thinking = None
+    for block in response.content:
+        if hasattr(block, "text"):
+            if block.type == "thinking":
+                thinking = block.text
+            elif response_text is None:
+                response_text = block.text
+    return response_text, thinking
+
+
+def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
+                      thinking_budget, model_name):
+    """
+    Streaming Anthropic call. Prints tokens to stdout as they arrive.
+    Thinking tokens are shown in dim color; normal text tokens are shown normally.
+    Returns (full_text, full_thinking).
+    """
+    stream = client.messages.create(
+        model=model_name,
+        system=system_msg or "You are a Dungeon Master for a text RPG.",
+        messages=merged,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking={"type": "enabled", "budget_tokens": thinking_budget},
+        stream=True,
+    )
+    full_text = ""
+    full_thinking = ""
+    current_block_type = None
+
+    try:
+        for event in stream:
+            if event.type == "content_block_start":
+                current_block_type = event.content_block.type
+            elif event.type == "content_block_delta":
+                delta = event.delta
+                if delta.type == "thinking_delta":
+                    full_thinking += delta.thinking
+                    sys.stdout.write(_c(delta.thinking, "dim"))
+                    sys.stdout.flush()
+                elif delta.type == "text_delta":
+                    full_text += delta.text
+                    sys.stdout.write(delta.text)
+                    sys.stdout.flush()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        pass
+
+    return full_text, full_thinking if full_thinking else None
 
 
 # ---------------------------------------------------------------------------
@@ -446,14 +643,13 @@ class GameEngine:
             {"role": "user", "content": "Please begin character creation."},
         ]
 
+        _show_thinking(duration=2.0)
         try:
-            dm_questions, dm_reasoning = _call_llm(char_prompt, temperature=0.9, max_tokens=512)
+            dm_questions, dm_reasoning = _call_llm(char_prompt, temperature=1, max_tokens=4096)
         except KeyboardInterrupt:
             print("\n  The Oracle's voice fades as you step away...\n")
             self.save_game()
             return False
-        print(f"  {_c('Dungeon Master', 'bold', 'cyan')}: {dm_questions}\n")
-
         # Store the DM's questions in conversation history
         self.messages.append({"role": "assistant", "content": dm_questions})
 
@@ -486,8 +682,9 @@ class GameEngine:
                 {"role": "assistant", "content": dm_questions},
                 {"role": "user", "content": f"CHARACTER_CREATION_RESPONSE: {player_input}"},
             ]
+            _show_thinking(duration=2.0)
             try:
-                response, char_reasoning = _call_llm(char_messages, temperature=0.85, max_tokens=2048)
+                response, char_reasoning = _call_llm(char_messages, temperature=1, max_tokens=16384)
             except KeyboardInterrupt:
                 print("\n  The Oracle's voice fades as you step away...\n")
                 self.save_game()
@@ -502,8 +699,6 @@ class GameEngine:
             ]
             if char_reasoning:
                 self.state["last_reasoning"] = char_reasoning
-
-            print(f"  {_c('Dungeon Master', 'bold', 'cyan')}: {response}\n")
 
             # Extract character info from the LLM response and player input
             self.state["status"] = "playing"
@@ -620,8 +815,9 @@ class GameEngine:
             # Send to LLM
             self.messages.append({"role": "user", "content": player_input})
 
+            _show_thinking(duration=2.0)
             try:
-                response, reasoning = _call_llm(self.messages, temperature=0.85, max_tokens=2048)
+                response, reasoning = _call_llm(self.messages, temperature=1, max_tokens=16384)
             except KeyboardInterrupt:
                 print("\n  The Oracle's voice fades as you step away...\n")
                 # Remove the user message that had no response
@@ -634,12 +830,11 @@ class GameEngine:
                 self.state["last_reasoning"] = reasoning
 
             # Keep messages manageable - remove oldest user messages beyond system prompt
-            # but keep the last 30 messages for context
-            if len(self.messages) > 32:
-                # Keep system + last 31 messages
-                self.messages = [self.messages[0]] + self.messages[-31:]
+            # but keep the last 100 messages for context (model supports 262k tokens)
+            if len(self.messages) > 104:
+                # Keep system + last 103 messages
+                self.messages = [self.messages[0]] + self.messages[-103:]
 
-            print(f"\n  {_c('Dungeon Master', 'bold', 'cyan')}: {response}")
             print()
 
             # Auto-save after each turn
