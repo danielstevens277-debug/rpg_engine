@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime
-from threading import Event, Thread
+from threading import Event, Thread, Lock
 
 # ---------------------------------------------------------------------------
 # Terminal helpers (no external deps required)
@@ -45,10 +45,15 @@ def _print_sep(char="=", color="cyan", width=62):
     print(_c(char * width, color))
 
 
+_stdout_lock = Lock()
+
+
 def _show_thinking(duration: float = 1.5):
     """
-    Show a thematic "Dungeon Master is thinking" indicator.
-    The dots animate in sequence as if the Oracle is pondering.
+    Show a thematic "Dungeon Master is thinking" indicator on a single line.
+    The dots animate in-place (using carriage return) as if the Oracle is pondering.
+    The line is automatically cleared when the animation stops so it does not
+    interfere with subsequent thinking or output blocks.
 
     Parameters:
         duration: Seconds to show the animation. Pass None to run
@@ -59,13 +64,12 @@ def _show_thinking(duration: float = 1.5):
         thread.join() to stop the animation, or pass duration=None
         and stop manually after the work is done.
     """
-    sys.stdout.write("  ")
-    sys.stdout.flush()
-
     dots = [".", "..", "..."]
     end_event = Event()
+    line = _c(f"  The Oracle ponders  {dots[0]}", "dim")
 
     def _animate():
+        nonlocal line
         elapsed = 0.0
         dot_idx = 0
         while not end_event.is_set():
@@ -76,9 +80,11 @@ def _show_thinking(duration: float = 1.5):
                     break
             else:
                 time.sleep(0.4)
-            sys.stdout.write(f"\r  {_c('The Oracle ponders', 'dim')}  {dots[dot_idx]}")
-            sys.stdout.flush()
+            with _stdout_lock:
+                sys.stdout.write(f"\r{line}")
+                sys.stdout.flush()
             dot_idx = (dot_idx + 1) % len(dots)
+            line = _c(f"  The Oracle ponders  {dots[dot_idx]}", "dim")
 
     thread = Thread(target=_animate, daemon=True)
     thread.start()
@@ -88,19 +94,47 @@ def _show_thinking(duration: float = 1.5):
         time.sleep(duration)
         end_event.set()
         thread.join(timeout=0.5)
-        # Clear the thinking line
-        sys.stdout.write("\r" + " " * 44 + "\r")
-        sys.stdout.flush()
 
     return end_event, thread
+
+
+def _clear_thinking_line():
+    """Clear the single-line thinking animation so it doesn't interfere with blocks."""
+    with _stdout_lock:
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
 
 
 def _stop_thinking(end_event, thread):
     """Stop a thinking animation started with _show_thinking(duration=None)."""
     end_event.set()
     thread.join(timeout=0.5)
-    sys.stdout.write("\r" + " " * 44 + "\r")
-    sys.stdout.flush()
+    _clear_thinking_line()
+
+
+# ---------------------------------------------------------------------------
+# Output blocks
+# ---------------------------------------------------------------------------
+
+_BLOCK_SEP = "─" * 58
+
+
+def _print_block(title: str, text: str, *colors):
+    """
+    Print a titled, bordered block of text.
+
+    Parameters:
+        title:  Block title (e.g. "Thinking" or "Output")
+        text:   The block content
+        colors: Color codes to apply to the title
+    """
+    with _stdout_lock:
+        print()
+        print(_c(_BLOCK_SEP, *colors))
+        print(_c(f"  {title}", *colors))
+        print(_c(_BLOCK_SEP, *colors))
+        print(_c(text, *colors))
+        print(_c(_BLOCK_SEP, *colors))
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +195,8 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
     """
     Call the LLM API. Supports OpenAI-compatible endpoints and Anthropic.
     Streams tokens to stdout in real-time when stream=True.
-    Returns a tuple of (response_text, reasoning_content) where reasoning_content
-    may be None if the model did not produce any.
+    Returns a tuple of (response_text, reasoning_content, thinking_end, thinking_thread)
+    where reasoning_content may be None if the model did not produce any.
     """
     config = _get_api_config()
 
@@ -206,28 +240,35 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True):
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
+        _stop_thinking(thinking_end, thinking_thread)
         error_msg = str(e).lower()
         if "connection" in error_msg or "timeout" in error_msg:
             return (
                 "  The connection to the Oracle has been lost.\n"
                 "     Please check your internet connection and try again.",
                 None,
+                thinking_end,
+                thinking_thread,
             )
         elif "rate" in error_msg or "limit" in error_msg:
             return (
                 "  The Oracle is speaking slowly... Please wait a moment.",
                 None,
+                thinking_end,
+                thinking_thread,
             )
         else:
             return (
                 f"  The Oracle stumbles: {str(e)[:200]}\n"
                 "     Please try again.",
                 None,
+                thinking_end,
+                thinking_thread,
             )
 
 
 def _nonstream_openai(client, kwargs):
-    """Non-streaming OpenAI call. Returns (content, reasoning)."""
+    """Non-streaming OpenAI call. Returns (content, reasoning, thinking_end, thinking_thread)."""
     response = client.chat.completions.create(**kwargs)
     choices = getattr(response, "choices", None)
     if choices:
@@ -235,15 +276,19 @@ def _nonstream_openai(client, kwargs):
         content = getattr(message, "content", None)
         reasoning = getattr(message, "reasoning_content", None)
         if content is not None:
-            return content, reasoning
-    return "  The Oracle is silent. Please try again.", None
+            _stop_thinking(thinking_end, thinking_thread)
+            if reasoning:
+                _print_block("  Thinking", reasoning.strip(), "dim")
+            _print_block("  Output", content.strip())
+            return content, reasoning, thinking_end, thinking_thread
+    return "  The Oracle is silent. Please try again.", None, thinking_end, thinking_thread
 
 
 def _stream_openai(client, kwargs):
     """
     Streaming OpenAI call. Prints tokens to stdout as they arrive.
-    Reasoning tokens are shown in dim color; normal tokens are shown normally.
-    Returns (full_content, full_reasoning).
+    Thinking content appears in a separate dim block; output in its own block.
+    Returns (full_content, full_reasoning, thinking_end, thinking_thread).
     """
     stream = client.chat.completions.create(**kwargs)
     full_content = ""
@@ -261,20 +306,25 @@ def _stream_openai(client, kwargs):
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 full_reasoning += reasoning
-                sys.stdout.write(_c(reasoning, "dim"))
-                sys.stdout.flush()
 
             content = getattr(delta, "content", None)
             if content:
                 full_content += content
-                sys.stdout.write(content)
-                sys.stdout.flush()
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         pass
 
-    return full_content, full_reasoning if full_reasoning else None
+    # Stop thinking animation before printing blocks
+    _stop_thinking(thinking_end, thinking_thread)
+
+    # Print blocks after streaming completes
+    if full_reasoning:
+        _print_block("  Thinking", full_reasoning.strip(), "dim")
+    if full_content:
+        _print_block("  Output", full_content.strip())
+
+    return full_content, full_reasoning if full_reasoning else None, thinking_end, thinking_thread
 
 
 def _get_anthropic_max_tokens(api_key, model_name, base_url=None):
@@ -373,12 +423,13 @@ def _call_anthropic(config, messages, temperature, max_tokens, stream=True):
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
-        return f"  The Oracle stumbles: {str(e)[:200]}", None
+        _stop_thinking(thinking_end, thinking_thread)
+        return f"  The Oracle stumbles: {str(e)[:200]}", None, thinking_end, thinking_thread
 
 
 def _nonstream_anthropic(client, system_msg, merged, temperature, max_tokens,
                          thinking_budget, model_name):
-    """Non-streaming Anthropic call. Returns (text, thinking)."""
+    """Non-streaming Anthropic call. Returns (text, thinking, thinking_end, thinking_thread)."""
     response = client.messages.create(
         model=model_name,
         system=system_msg or "You are a Dungeon Master for a text RPG.",
@@ -395,15 +446,20 @@ def _nonstream_anthropic(client, system_msg, merged, temperature, max_tokens,
                 thinking = block.text
             elif response_text is None:
                 response_text = block.text
-    return response_text, thinking
+    _stop_thinking(thinking_end, thinking_thread)
+    if thinking:
+        _print_block("  Thinking", thinking.strip(), "dim")
+    if response_text:
+        _print_block("  Output", response_text.strip())
+    return response_text, thinking, thinking_end, thinking_thread
 
 
 def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
                       thinking_budget, model_name):
     """
     Streaming Anthropic call. Prints tokens to stdout as they arrive.
-    Thinking tokens are shown in dim color; normal text tokens are shown normally.
-    Returns (full_text, full_thinking).
+    Thinking content appears in a separate dim block; output in its own block.
+    Returns (full_text, full_thinking, thinking_end, thinking_thread).
     """
     stream = client.messages.create(
         model=model_name,
@@ -426,18 +482,23 @@ def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
                 delta = event.delta
                 if delta.type == "thinking_delta":
                     full_thinking += delta.thinking
-                    sys.stdout.write(_c(delta.thinking, "dim"))
-                    sys.stdout.flush()
                 elif delta.type == "text_delta":
                     full_text += delta.text
-                    sys.stdout.write(delta.text)
-                    sys.stdout.flush()
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         pass
 
-    return full_text, full_thinking if full_thinking else None
+    # Stop thinking animation before printing blocks
+    _stop_thinking(thinking_end, thinking_thread)
+
+    # Print blocks after streaming completes
+    if full_thinking:
+        _print_block("  Thinking", full_thinking.strip(), "dim")
+    if full_text:
+        _print_block("  Output", full_text.strip())
+
+    return full_text, full_thinking if full_thinking else None, thinking_end, thinking_thread
 
 
 # ---------------------------------------------------------------------------
@@ -668,13 +729,12 @@ class GameEngine:
 
         thinking_end, thinking_thread = _show_thinking(duration=None)
         try:
-            dm_questions, dm_reasoning = _call_llm(char_prompt, temperature=1, max_tokens=4096)
+            dm_questions, dm_reasoning, thinking_end, thinking_thread = _call_llm(char_prompt, temperature=1, max_tokens=4096)
         except KeyboardInterrupt:
             _stop_thinking(thinking_end, thinking_thread)
             print("\n  The Oracle's voice fades as you step away...\n")
             self.save_game()
             return False
-        _stop_thinking(thinking_end, thinking_thread)
         # Store the DM's questions in conversation history
         self.messages.append({"role": "assistant", "content": dm_questions})
 
@@ -709,13 +769,12 @@ class GameEngine:
             ]
             thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
-                response, char_reasoning = _call_llm(char_messages, temperature=1, max_tokens=16384)
+                response, char_reasoning, thinking_end, thinking_thread = _call_llm(char_messages, temperature=1, max_tokens=16384)
             except KeyboardInterrupt:
                 _stop_thinking(thinking_end, thinking_thread)
                 print("\n  The Oracle's voice fades as you step away...\n")
                 self.save_game()
                 return False
-            _stop_thinking(thinking_end, thinking_thread)
 
             # Update messages to include the full character creation exchange
             self.messages = [
@@ -835,7 +894,8 @@ class GameEngine:
                         save_path.unlink()
                     self.state = None
                     print("  A new world awaits. Let us begin.\n")
-                    self.create_character()
+                    if not self.create_character():
+                        return
                     print()
                 continue
 
@@ -844,7 +904,7 @@ class GameEngine:
 
             thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
-                response, reasoning = _call_llm(self.messages, temperature=1, max_tokens=16384)
+                response, reasoning, thinking_end, thinking_thread = _call_llm(self.messages, temperature=1, max_tokens=16384)
             except KeyboardInterrupt:
                 _stop_thinking(thinking_end, thinking_thread)
                 print("\n  The Oracle's voice fades as you step away...\n")
@@ -852,7 +912,6 @@ class GameEngine:
                 self.messages.pop()
                 self.save_game()
                 continue
-            _stop_thinking(thinking_end, thinking_thread)
 
             self.messages.append({"role": "assistant", "content": response})
             if reasoning:
