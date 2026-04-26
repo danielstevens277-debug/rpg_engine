@@ -137,6 +137,21 @@ def _print_block(title: str, text: str, *colors):
         print(_c(_BLOCK_SEP, *colors))
 
 
+def _stream_block_begin(title: str, *colors):
+    """Begin a streaming block: print header (separator + title + separator)."""
+    with _stdout_lock:
+        print()
+        print(_c(_BLOCK_SEP, *colors))
+        print(_c(f"  {title}", *colors))
+        print(_c(_BLOCK_SEP, *colors))
+
+
+def _stream_block_end(*colors):
+    """End a streaming block: print closing separator."""
+    with _stdout_lock:
+        print(_c(_BLOCK_SEP, *colors))
+
+
 # ---------------------------------------------------------------------------
 # LLM integration
 # ---------------------------------------------------------------------------
@@ -295,6 +310,9 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
     stream = client.chat.completions.create(**kwargs)
     full_content = ""
     full_reasoning = ""
+    in_thinking = False
+    thinking_started = False
+    output_started = False
 
     try:
         for chunk in stream:
@@ -307,24 +325,35 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
 
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
+                if not thinking_started:
+                    thinking_started = True
+                    _stop_thinking(thinking_end, thinking_thread)
+                    _stream_block_begin("  Thinking", "dim")
+                with _stdout_lock:
+                    sys.stdout.write(reasoning)
+                    sys.stdout.flush()
                 full_reasoning += reasoning
 
             content = getattr(delta, "content", None)
             if content:
+                if thinking_started and not output_started:
+                    output_started = True
+                    _stream_block_end("dim")
+                    _stream_block_begin("  Output")
+                with _stdout_lock:
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
                 full_content += content
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         pass
 
-    # Stop thinking animation before printing blocks
-    _stop_thinking(thinking_end, thinking_thread)
-
-    # Print blocks after streaming completes
-    if full_reasoning:
-        _print_block("  Thinking", full_reasoning.strip(), "dim")
-    if full_content:
-        _print_block("  Output", full_content.strip())
+    # Close blocks
+    if thinking_started:
+        _stream_block_end("dim")
+    if output_started:
+        _stream_block_end()
 
     return full_content, full_reasoning if full_reasoning else None, thinking_end, thinking_thread
 
@@ -477,31 +506,43 @@ def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
     )
     full_text = ""
     full_thinking = ""
-    current_block_type = None
+    thinking_started = False
+    output_started = False
 
     try:
         for event in stream:
             if event.type == "content_block_start":
-                current_block_type = event.content_block.type
+                pass  # block type info not needed for streaming
             elif event.type == "content_block_delta":
                 delta = event.delta
                 if delta.type == "thinking_delta":
+                    if not thinking_started:
+                        thinking_started = True
+                        _stop_thinking(thinking_end, thinking_thread)
+                        _stream_block_begin("  Thinking", "dim")
+                    with _stdout_lock:
+                        sys.stdout.write(delta.thinking)
+                        sys.stdout.flush()
                     full_thinking += delta.thinking
                 elif delta.type == "text_delta":
+                    if thinking_started and not output_started:
+                        output_started = True
+                        _stream_block_end("dim")
+                        _stream_block_begin("  Output")
+                    with _stdout_lock:
+                        sys.stdout.write(delta.text)
+                        sys.stdout.flush()
                     full_text += delta.text
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         pass
 
-    # Stop thinking animation before printing blocks
-    _stop_thinking(thinking_end, thinking_thread)
-
-    # Print blocks after streaming completes
-    if full_thinking:
-        _print_block("  Thinking", full_thinking.strip(), "dim")
-    if full_text:
-        _print_block("  Output", full_text.strip())
+    # Close blocks
+    if thinking_started:
+        _stream_block_end("dim")
+    if output_started:
+        _stream_block_end()
 
     return full_text, full_thinking if full_thinking else None, thinking_end, thinking_thread
 
