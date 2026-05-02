@@ -6,6 +6,7 @@ A pure natural-language, terminal-based RPG where an LLM acts as a system-agnost
 
 - **Pure natural-language interaction** — describe actions, ask questions, talk to NPCs, examine objects. Everything is freeform.
 - **System-agnostic DM** — the LLM handles all mechanics behind the scenes. No dice, no numbers, no game notation visible to the player.
+- **Auto-Play mode** — watch the LLM play both the Dungeon Master and the player character, generating a self-directed story.
 - **Persistent character state** — your character, world state, and full conversation history are saved to a JSON file. Pick up where you left off.
 - **Character creation** — describe your character in natural language. The LLM interprets your description and weaves it into the world.
 - **OpenAI-compatible API** — works with any OpenAI-compatible endpoint (OpenAI, local models via Ollama/LM Studio, etc.). Also supports Anthropic Claude.
@@ -39,9 +40,27 @@ export RPG_API_KEY="sk-your-key-here"
 
 ### Run
 
+#### Interactive Mode (Human Plays)
+
 ```bash
 python main.py
 ```
+
+#### Auto-Play Mode (LLM Plays Both Roles)
+
+```bash
+python autoplay.py              # Continue from saved game
+python autoplay.py --new        # Start a fresh auto-play game
+python autoplay.py --turns 20   # Limit to 20 DM-player turns
+python autoplay.py --new --turns 20 --char-choice  # New game with character choice
+```
+
+**Auto-Play Modes:**
+- `--new` — Start a fresh game instead of continuing from a save
+- `--turns N` — Maximum number of DM-player turn pairs (default: 50)
+- `--char-choice` — Choose between AI-generated character or manual description at startup
+
+In auto-play mode, the LLM alternates between the **Dungeon Master** (narrating the world) and the **Player Character** (deciding what to do next), generating a self-directed story with streaming output, thinking blocks, and styled narrative presentation.
 
 ## Configuration
 
@@ -81,6 +100,8 @@ python main.py
 
 ### Architecture
 
+#### Interactive Mode (Human Plays)
+
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │   Terminal   │────▶│   Engine     │────▶│     LLM      │
@@ -90,6 +111,20 @@ python main.py
 │  language    │     │  persistence │     │  responses   │
 │  input       │     │  State mgmt  │     │  (no mechanics│
 │              │     │  Game loop   │     │   visible)    │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+#### Auto-Play Mode (LLM Plays Both Roles)
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Terminal   │◀────│   Engine     │◀────│     LLM      │
+│   (observer) │     │   (Python)   │     │   (GPT-4 etc)│
+│              │     │              │     │              │
+│  Styled      │     │  JSON        │     │  DM role ────▶│
+│  narrative   │     │  persistence │     │  Player role ─▶│
+│  output      │     │  State mgmt  │     │  (dual roles) │
+│              │     │  Game loop   │     │              │
 └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
@@ -137,7 +172,7 @@ The game state is stored as JSON at `~/.rpg_engine_save.json`:
 }
 ```
 
-## Commands
+## Commands (Interactive Mode)
 
 | Input | Action |
 |---|---|
@@ -146,6 +181,32 @@ The game state is stored as JSON at `~/.rpg_engine_save.json`:
 | `save` | Manually save the current game |
 | `status` | Show character and game status |
 | `help` | Show available commands |
+
+## Auto-Play Mode
+
+Auto-play mode lets the LLM play both the Dungeon Master and the player character, generating a self-directed story. Each role gets its own thinking block and output block, with the player character styled in green and the DM in cyan.
+
+**How it works:**
+1. **Character Creation** — Either AI-generates a character or you describe one
+2. **Starting Scenario** — The DM generates an opening scene based on the character
+3. **Game Loop** — The DM narrates, then the player character decides what to do, repeating
+4. **Persistence** — The game saves after each complete turn (DM + player pair)
+
+**Visual presentation:**
+- 🟢 Green blocks — Player character actions and dialogue
+- 🔵 Cyan blocks — Dungeon Master narrative
+- ⚫ Dim blocks — Thinking/reasoning content
+- 🟡 Turn counter — Shows progress through the turn limit
+
+## Commands (Auto-Play)
+
+| Argument | Action |
+|---|---|
+| _(no args)_ | Continue from saved game |
+| `--new` | Start a fresh game |
+| `--turns N` | Limit to N DM-player turn pairs (default: 50) |
+| `--char-choice` | Choose character creation mode at startup |
+| `--help` | Show help message |
 
 ## Design Philosophy
 

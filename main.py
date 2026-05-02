@@ -11,20 +11,19 @@ through natural language questions and actions - no menus, no buttons.
 import sys
 import os
 
-# Resolve the engine module relative to this file's location
-def _import_game_engine():
-    """Import GameEngine, supporting both 'python main.py' and 'python rpg_engine/main.py'."""
+def _import_game_engine_module():
+    """Import engine module, supporting both 'python main.py' and 'python rpg_engine/main.py'."""
     # 1. Try bare import (works when run from inside rpg_engine/)
     try:
-        from engine import GameEngine
-        return GameEngine
+        import engine
+        return engine
     except ImportError:
         pass
 
     # 2. Try package import (works when rpg_engine/ is on the path)
     try:
-        from rpg_engine.engine import GameEngine
-        return GameEngine
+        import rpg_engine.engine as engine
+        return engine
     except ImportError:
         pass
 
@@ -38,7 +37,7 @@ def _import_game_engine():
                 raise ImportError(f"Could not create module spec for {engine_path}")
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            return mod.GameEngine
+            return mod
         except Exception as e:
             print(f"  Failed to load engine module: {e}")
             sys.exit(1)
@@ -47,8 +46,45 @@ def _import_game_engine():
     sys.exit(1)
 
 
-GameEngine = _import_game_engine()
-from engine import _c, _state_path
+engine_mod = _import_game_engine_module()
+GameEngine = engine_mod.GameEngine
+_c = engine_mod._c
+_state_path = engine_mod._state_path
+
+
+def _import_autoplay():
+    """Import autoplay module, supporting both python main.py and python rpg_engine/main.py."""
+    try:
+        import autoplay
+        return autoplay
+    except ImportError:
+        pass
+    try:
+        import rpg_engine.autoplay as autoplay
+        return autoplay
+    except ImportError:
+        pass
+    autoplay_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autoplay.py")
+    if os.path.isfile(autoplay_path):
+        import importlib.util
+        try:
+            spec = importlib.util.spec_from_file_location("autoplay", autoplay_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not create module spec for {autoplay_path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception as e:
+            print(f"  Failed to load autoplay module: {e}")
+            sys.exit(1)
+    print("  Could not find autoplay.py. Make sure you're running from the rpg_engine/ directory.")
+    sys.exit(1)
+
+
+def _launch_autoplay(engine):
+    """Launch autoplay mode with the given engine state."""
+    autoplay = _import_autoplay()
+    autoplay.autoplay_game_loop(engine, max_turns=50, sandbox=True)
 
 
 def print_banner():
@@ -84,13 +120,20 @@ def main():
         print()
         print(f"  {_c('[1]', 'green')} Continue your adventure")
         print(f"  {_c('[2]', 'green')} Start a new adventure")
+        print(f"  {_c('[3]', 'green')} Watch an adventure unfold (autoplay)")
+        print(f"  {_c('[4]', 'green')} Start a fresh auto-play adventure")
         print(f"  {_c('[q]', 'green')} Quit")
         print()
         choice = input("  [?] What do you do? " + _c(">", "green") + " ").strip().lower()
         if choice in ("q", "exit", "quit"):
             print("  Your legend remains unwritten... for now.\n")
             return
-        if choice == "2":
+        if choice == "1":
+            # Continue existing game
+            print("  Loading your adventure...")
+            engine.load_game()
+            print("  Welcome back, adventurer.\n")
+        elif choice == "2":
             # Remove old save before starting new
             save_path = _state_path()
             if save_path.exists():
@@ -99,8 +142,24 @@ def main():
             print("  A new world awaits. Let us begin.\n")
             if not engine.create_character():
                 return
+        elif choice == "3":
+            # Watch an adventure unfold (autoplay with existing save)
+            print("  Loading your adventure...")
+            engine.load_game()
+            print("  The Oracle takes the reins...\n")
+            _launch_autoplay(engine)
+            return
+        elif choice == "4":
+            # Start a fresh auto-play adventure (no save)
+            save_path = _state_path()
+            if save_path.exists():
+                save_path.unlink()
+            engine.state = None
+            print("  The Oracle prepares to play both sides...\n")
+            _launch_autoplay(engine)
+            return
         else:
-            # Continue existing game
+            # Default: continue existing game
             print("  Loading your adventure...")
             engine.load_game()
             print("  Welcome back, adventurer.\n")
