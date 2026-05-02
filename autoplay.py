@@ -708,7 +708,42 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
 
     turn = 0
     try:
+        # Determine who should start based on the last message in history
+        # If the last message was from the assistant (DM), the AI player should go first.
+        # If the last message was from the user (Player), the DM should go first.
+        start_with_dm = True
+        if engine.messages:
+            last_msg = engine.messages[-1]
+            if last_msg.get("role") == "assistant":
+                start_with_dm = False
+
         while turn < max_turns:
+            if not start_with_dm:
+                # --- PLAYER TURN FIRST ---
+                print(_c("  Your character considers their next move...", "dim"))
+                print()
+
+                # Build player messages: system (identity) + conversation history
+                player_messages = [
+                    {"role": "system", "content": player_prompt},
+                ]
+                player_messages.extend(engine.messages)
+
+                player_response, player_reasoning, thinking_end, thinking_thread = _call_llm(
+                    player_messages, temperature=0.9, max_tokens=1024, stream=True
+                )
+                _stop_thinking(thinking_end, thinking_thread)
+
+                if player_reasoning:
+                    _print_thinking_block("  Thinking", player_reasoning)
+                _print_player_action(player_response)
+
+                # Add player response to conversation history
+                engine.messages.append({"role": "user", "content": player_response})
+                
+                # Now we can proceed to the normal DM -> Player cycle
+                start_with_dm = True
+
             # --- DUNGEON MASTER TURN ---
             turn += 1
             print(_c(f"  \u25C6 Turn {turn}/{max_turns}", "bold", "yellow"))
@@ -760,6 +795,7 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
 
             # Add player response to conversation history
             engine.messages.append({"role": "user", "content": player_response})
+
 
             # Keep conversation manageable
             if len(engine.messages) > 104:

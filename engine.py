@@ -107,8 +107,10 @@ def _clear_thinking_line():
 
 def _stop_thinking(end_event, thread):
     """Stop a thinking animation started with _show_thinking(duration=None)."""
-    end_event.set()
-    thread.join(timeout=0.5)
+    if end_event:
+        end_event.set()
+    if thread:
+        thread.join(timeout=0.5)
     _clear_thinking_line()
 
 
@@ -286,31 +288,30 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True,
 
 def _nonstream_openai(client, kwargs, thinking_end, thinking_thread):
     """Non-streaming OpenAI call. Returns (content, reasoning, thinking_end, thinking_thread)."""
-    response = client.chat.completions.create(**kwargs)
-    choices = getattr(response, "choices", None)
-    if choices:
-        message = getattr(choices[0], "message", None)
-        content = getattr(message, "content", None)
-        reasoning = getattr(message, "reasoning_content", None)
-        if content is not None:
-            _stop_thinking(thinking_end, thinking_thread)
-            if reasoning:
-                _print_block("  Thinking", reasoning.strip(), "dim")
-            _print_block("  Output", content.strip())
-            return content, reasoning, thinking_end, thinking_thread
-    return "  The Oracle is silent. Please try again.", None, thinking_end, thinking_thread
+    try:
+        response = client.chat.completions.create(**kwargs)
+        choices = getattr(response, "choices", None)
+        if choices:
+            message = getattr(choices[0], "message", None)
+            content = getattr(message, "content", None)
+            reasoning = getattr(message, "reasoning_content", None)
+            if content is not None:
+                _print_block("  Output", content.strip())
+                return content, reasoning, thinking_end, thinking_thread
+        return "  The Oracle is silent. Please try again.", None, thinking_end, thinking_thread
+    finally:
+        _stop_thinking(thinking_end, thinking_thread)
 
 
 def _stream_openai(client, kwargs, thinking_end, thinking_thread):
     """
     Streaming OpenAI call. Prints tokens to stdout as they arrive.
-    Thinking content appears in a separate dim block; output in its own block.
+    Thinking content is collected but not printed. Output in its own block.
     Returns (full_content, full_reasoning, thinking_end, thinking_thread).
     """
     stream = client.chat.completions.create(**kwargs)
     full_content = ""
     full_reasoning = ""
-    in_thinking = False
     thinking_started = False
     output_started = False
 
@@ -328,17 +329,12 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
                 if not thinking_started:
                     thinking_started = True
                     _stop_thinking(thinking_end, thinking_thread)
-                    _stream_block_begin("  Thinking", "dim")
-                with _stdout_lock:
-                    sys.stdout.write(reasoning)
-                    sys.stdout.flush()
                 full_reasoning += reasoning
 
             content = getattr(delta, "content", None)
             if content:
-                if thinking_started and not output_started:
+                if not output_started:
                     output_started = True
-                    _stream_block_end("dim")
                     _stream_block_begin("  Output")
                 with _stdout_lock:
                     sys.stdout.write(content)
@@ -348,10 +344,10 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
         raise
     except Exception:
         pass
+    finally:
+        _stop_thinking(thinking_end, thinking_thread)
 
     # Close blocks
-    if thinking_started:
-        _stream_block_end("dim")
     if output_started:
         _stream_block_end()
 
@@ -464,35 +460,35 @@ def _call_anthropic(config, messages, temperature, max_tokens, stream=True,
 def _nonstream_anthropic(client, system_msg, merged, temperature, max_tokens,
                          thinking_budget, model_name, thinking_end, thinking_thread):
     """Non-streaming Anthropic call. Returns (text, thinking, thinking_end, thinking_thread)."""
-    response = client.messages.create(
-        model=model_name,
-        system=system_msg or "You are a Dungeon Master for a text RPG.",
-        messages=merged,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        thinking={"type": "enabled", "budget_tokens": thinking_budget},
-    )
-    response_text = None
-    thinking = None
-    for block in response.content:
-        if hasattr(block, "text"):
-            if block.type == "thinking":
-                thinking = block.text
-            elif response_text is None:
-                response_text = block.text
-    _stop_thinking(thinking_end, thinking_thread)
-    if thinking:
-        _print_block("  Thinking", thinking.strip(), "dim")
-    if response_text:
-        _print_block("  Output", response_text.strip())
-    return response_text, thinking, thinking_end, thinking_thread
+    try:
+        response = client.messages.create(
+            model=model_name,
+            system=system_msg or "You are a Dungeon Master for a text RPG.",
+            messages=merged,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking={"type": "enabled", "budget_tokens": thinking_budget},
+        )
+        response_text = None
+        thinking = None
+        for block in response.content:
+            if hasattr(block, "text"):
+                if block.type == "thinking":
+                    thinking = block.text
+                elif response_text is None:
+                    response_text = block.text
+        if response_text:
+            _print_block("  Output", response_text.strip())
+        return response_text, thinking, thinking_end, thinking_thread
+    finally:
+        _stop_thinking(thinking_end, thinking_thread)
 
 
 def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
                       thinking_budget, model_name, thinking_end, thinking_thread):
     """
     Streaming Anthropic call. Prints tokens to stdout as they arrive.
-    Thinking content appears in a separate dim block; output in its own block.
+    Thinking content is collected but not printed. Output in its own block.
     Returns (full_text, full_thinking, thinking_end, thinking_thread).
     """
     stream = client.messages.create(
@@ -519,15 +515,10 @@ def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
                     if not thinking_started:
                         thinking_started = True
                         _stop_thinking(thinking_end, thinking_thread)
-                        _stream_block_begin("  Thinking", "dim")
-                    with _stdout_lock:
-                        sys.stdout.write(delta.thinking)
-                        sys.stdout.flush()
                     full_thinking += delta.thinking
                 elif delta.type == "text_delta":
-                    if thinking_started and not output_started:
+                    if not output_started:
                         output_started = True
-                        _stream_block_end("dim")
                         _stream_block_begin("  Output")
                     with _stdout_lock:
                         sys.stdout.write(delta.text)
@@ -537,10 +528,10 @@ def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
         raise
     except Exception:
         pass
+    finally:
+        _stop_thinking(thinking_end, thinking_thread)
 
     # Close blocks
-    if thinking_started:
-        _stream_block_end("dim")
     if output_started:
         _stream_block_end()
 
@@ -810,7 +801,7 @@ class GameEngine:
 
             # Build messages including the DM's questions for full context
             char_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT + "\n\nAfter your narrative response, please provide the extracted character details in a JSON block like this:\n```json\n{\"name\": \"...\", \"race\": \"...\", \"class\": \"...\"}\n```"},
                 {"role": "assistant", "content": dm_questions},
                 {"role": "user", "content": f"CHARACTER_CREATION_RESPONSE: {player_input}"},
             ]
@@ -836,45 +827,57 @@ class GameEngine:
 
             # Extract character info from the LLM response and player input
             self.state["status"] = "playing"
-            self.state["character"]["name"] = "the adventurer"
-            self.state["character"]["race"] = "unknown"
-            self.state["character"]["class"] = "unknown"
+            self.state["character"] = {"name": "the adventurer", "race": "unknown", "class": "unknown"}
 
-            # Try multiple patterns to extract character details from the LLM's narrative
-            name_patterns = [
-                r'your name is (\w[\w ]*?)(?:[,.\s]|$)',
-                r'you are (?:named|called) (\w[\w ]*?)(?:[,.\s]|$)',
-                r'(\w[\w ]*?), (?:a|an) (?:brave|young|weary|fierce)',
-            ]
-            for pattern in name_patterns:
-                m = re.search(pattern, response, re.IGNORECASE)
-                if m:
-                    self.state["character"]["name"] = m.group(1).strip()
-                    break
+            # Try to extract structured JSON from the LLM response first
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
+            if json_match:
+                try:
+                    char_data = json.loads(json_match.group(1))
+                    self.state["character"]["name"] = char_data.get("name", self.state["character"]["name"])
+                    self.state["character"]["race"] = char_data.get("race", self.state["character"]["race"])
+                    self.state["character"]["class"] = char_data.get("class", self.state["character"]["class"])
+                except json.JSONDecodeError:
+                    pass
 
-            race_patterns = [
-                r'(?:race|blood|kind) is (\w[\w ]*?)(?:[,.\s]|$)',
-                r'(?:a|an) (\w[\w ]*?)(?:\s+by\s+race|\s+by\s+kind|\s+by\s+blood)',
-                r'you are (?:a|an) (\w[\w ]*?)(?:\s+(?:warrior|mage|rogue|healer|hunter|knight|scholar|wanderer))',
-            ]
-            for pattern in race_patterns:
-                m = re.search(pattern, response, re.IGNORECASE)
-                if m:
-                    self.state["character"]["race"] = m.group(1).strip()
-                    break
+            # Fallback: Try multiple patterns to extract details from the LLM's narrative
+            if self.state["character"]["name"] == "the adventurer":
+                name_patterns = [
+                    r'your name is (\w[\w ]*?)(?:[,.\s]|$)',
+                    r'you are (?:named|called) (\w[\w ]*?)(?:[,.\s]|$)',
+                    r'(\w[\w ]*?), (?:a|an) (?:brave|young|weary|fierce)',
+                ]
+                for pattern in name_patterns:
+                    m = re.search(pattern, response, re.IGNORECASE)
+                    if m:
+                        self.state["character"]["name"] = m.group(1).strip()
+                        break
 
-            class_patterns = [
-                r'(?:class|role|vocation) is (\w[\w ]*?)(?:[,.\s]|$)',
-                r'(?:a|an) (\w[\w ]*?)(?:\s+(?:of|who|with|named|called))',
-                r'you are (?:a|an) (\w[\w ]*?)(?:\s+(?:who|with|named|called|of))',
-            ]
-            for pattern in class_patterns:
-                m = re.search(pattern, response, re.IGNORECASE)
-                if m:
-                    self.state["character"]["class"] = m.group(1).strip()
-                    break
+            if self.state["character"]["race"] == "unknown":
+                race_patterns = [
+                    r'(?:race|blood|kind) is (\w[\w ]*?)(?:[,.\s]|$)',
+                    r'(?:a|an) (\w[\w ]*?)(?:\s+by\s+race|\s+by\s+kind|\s+by\s+blood)',
+                    r'you are (?:a|an) (\w[\w ]*?)(?:\s+(?:warrior|mage|rogue|healer|hunter|knight|scholar|wanderer))',
+                ]
+                for pattern in race_patterns:
+                    m = re.search(pattern, response, re.IGNORECASE)
+                    if m:
+                        self.state["character"]["race"] = m.group(1).strip()
+                        break
 
-            # Fallback: try to extract from the player's original input
+            if self.state["character"]["class"] == "unknown":
+                class_patterns = [
+                    r'(?:class|role|vocation) is (\w[\w ]*?)(?:[,.\s]|$)',
+                    r'(?:a|an) (\w[\w ]*?)(?:\s+(?:of|who|with|named|called))',
+                    r'you are (?:a|an) (\w[\w ]*?)(?:\s+(?:who|with|named|called|of))',
+                ]
+                for pattern in class_patterns:
+                    m = re.search(pattern, response, re.IGNORECASE)
+                    if m:
+                        self.state["character"]["class"] = m.group(1).strip()
+                        break
+
+            # Final fallback: try to extract from the player's original input
             if self.state["character"]["name"] == "the adventurer":
                 name_match = re.search(r'(?:my name is|i am (?:named|called|going by))\s+(\w[\w ]*?)\b', player_input, re.IGNORECASE)
                 if name_match:
