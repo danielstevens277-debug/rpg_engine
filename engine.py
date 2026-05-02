@@ -189,8 +189,8 @@ def _get_api_config():
     }
 
 
-def _get_max_tokens(client, model_name):
-    """Query the API for the model's context length and return a safe max_tokens budget."""
+def _get_context_window(client, model_name):
+    """Query the API for the model's context length."""
     try:
         # Try to fetch model metadata
         model_info = client.models.retrieve(model=model_name)
@@ -200,12 +200,11 @@ def _get_max_tokens(client, model_name):
             if ctx:
                 break
         if ctx and isinstance(ctx, (int, float)) and ctx > 0:
-            # Leave 4k headroom for system prompt + response
-            return int(min(ctx * 0.95, ctx - 4096))
+            return int(ctx)
     except Exception:
         pass
-    # Fallback: use the caller's default
-    return None
+    # Fallback: use a reasonable default for modern models
+    return 131072
 
 
 def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True,
@@ -238,11 +237,6 @@ def _call_llm(messages, temperature=0.85, max_tokens=16384, stream=True,
             kwargs["base_url"] = config["base_url"]
 
         client = openai.OpenAI(**kwargs)
-
-        # Query the endpoint for the model's actual context length
-        effective_max = _get_max_tokens(client, config["model"])
-        if effective_max is not None:
-            max_tokens = effective_max
 
         kwargs = {
             "model": config["model"],
@@ -354,7 +348,7 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
     return full_content, full_reasoning if full_reasoning else None, thinking_end, thinking_thread
 
 
-def _get_anthropic_max_tokens(api_key, model_name, base_url=None):
+def _get_anthropic_context_window(api_key, model_name, base_url=None):
     """Query Anthropic API for the model's context length."""
     try:
         import httpx
@@ -366,10 +360,10 @@ def _get_anthropic_max_tokens(api_key, model_name, base_url=None):
             for attr in ("context_window", "context_length", "max_input_tokens"):
                 ctx = data.get(attr)
                 if ctx and isinstance(ctx, (int, float)) and ctx > 0:
-                    return int(min(ctx * 0.95, ctx - 4096))
+                    return int(ctx)
     except Exception:
         pass
-    return None
+    return 131072
 
 
 def _call_anthropic(config, messages, temperature, max_tokens, stream=True,
@@ -430,16 +424,14 @@ def _call_anthropic(config, messages, temperature, max_tokens, stream=True,
             kwargs.pop("base_url", None)
             client = anthropic.Anthropic(**kwargs)
 
-        # Query the endpoint for the model's actual context length
-        effective_max = _get_anthropic_max_tokens(
+        # Query the endpoint for the model's actual context window
+        ctx_window = _get_anthropic_context_window(
             config["api_key"], config["model"] or "claude-sonnet-4-20250514",
             config.get("base_url")
         )
-        if effective_max is not None:
-            max_tokens = effective_max
 
         # Enable thinking with a budget proportional to the context window
-        thinking_budget = max(8192, min(max_tokens // 2, 131072))
+        thinking_budget = max(8192, min(ctx_window // 4, 131072))
         model_name = config["model"] or "claude-sonnet-4-20250514"
 
         if stream:
@@ -706,6 +698,22 @@ class GameEngine:
         """Check if a saved game exists."""
         return self.state is not None
 
+    def _get_current_context_limit(self):
+        """Determine the current model's context window size."""
+        config = _get_api_config()
+        if config["provider"] == "anthropic":
+            return _get_anthropic_context_window(
+                config["api_key"], config["model"] or "claude-sonnet-4-20250514",
+                config.get("base_url")
+            )
+        else:
+            try:
+                import openai
+                client = openai.OpenAI(api_key=config["api_key"], base_url=config["base_url"] or None)
+                return _get_context_window(client, config["model"])
+            except Exception:
+                return 131072
+
     def load_game(self):
         """Load a saved game and restore conversation history."""
         if self.state:
@@ -766,7 +774,7 @@ class GameEngine:
 
         thinking_end, thinking_thread = _show_thinking(duration=None)
         try:
-            dm_questions, dm_reasoning, thinking_end, thinking_thread = _call_llm(char_prompt, temperature=1, max_tokens=4096,
+            dm_questions, dm_reasoning, thinking_end, thinking_thread = _call_llm(char_prompt, temperature=1,
                                                                                    thinking_end=thinking_end, thinking_thread=thinking_thread)
         except KeyboardInterrupt:
             _stop_thinking(thinking_end, thinking_thread)
@@ -807,7 +815,7 @@ class GameEngine:
             ]
             thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
-                response, char_reasoning, thinking_end, thinking_thread = _call_llm(char_messages, temperature=1, max_tokens=16384,
+                response, char_reasoning, thinking_end, thinking_thread = _call_llm(char_messages, temperature=1,
                                                                                       thinking_end=thinking_end, thinking_thread=thinking_thread)
             except KeyboardInterrupt:
                 _stop_thinking(thinking_end, thinking_thread)
@@ -955,7 +963,7 @@ class GameEngine:
 
             thinking_end, thinking_thread = _show_thinking(duration=None)
             try:
-                response, reasoning, thinking_end, thinking_thread = _call_llm(self.messages, temperature=1, max_tokens=16384,
+                response, reasoning, thinking_end, thinking_thread = _call_llm(self.messages, temperature=1,
                                                                                  thinking_end=thinking_end, thinking_thread=thinking_thread)
             except KeyboardInterrupt:
                 _stop_thinking(thinking_end, thinking_thread)
@@ -969,11 +977,27 @@ class GameEngine:
             if reasoning:
                 self.state["last_reasoning"] = reasoning
 
-            # Keep messages manageable - remove oldest user messages beyond system prompt
-            # but keep the last 100 messages for context (model supports 262k tokens)
-            if len(self.messages) > 104:
-                # Keep system + last 103 messages
-                self.messages = [self.messages[0]] + self.messages[-103:]
+            # Keep messages manageable based on model context limit
+            ctx_limit = self._get_current_context_limit()
+            # Estimate tokens: roughly 4 characters per token. 
+            # Leave 8k tokens for system prompt and response.
+            max_prompt_chars = (ctx_limit - 8192) * 4
+            
+            total_chars = 0
+            keep_idx = 0
+            # Always keep the system prompt
+            total_chars += len(self.messages[0].get("content", ""))
+            
+            # Count characters from newest to oldest
+            for i in range(len(self.messages) - 1, 0, -1):
+                msg_len = len(self.messages[i].get("content", ""))
+                if total_chars + msg_len > max_prompt_chars:
+                    keep_idx = i + 1
+                    break
+                total_chars += msg_len
+            
+            if keep_idx > 1:
+                self.messages = [self.messages[0]] + self.messages[keep_idx:]
 
             print()
 

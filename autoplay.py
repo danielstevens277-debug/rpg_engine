@@ -797,9 +797,28 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
             engine.messages.append({"role": "user", "content": player_response})
 
 
-            # Keep conversation manageable
-            if len(engine.messages) > 104:
-                engine.messages = [engine.messages[0]] + engine.messages[-103:]
+            # Keep conversation manageable based on model context limit
+            ctx_limit = engine._get_current_context_limit()
+            # Estimate tokens: roughly 4 characters per token.
+            # Leave 8k tokens for system prompt and response.
+            max_prompt_chars = (ctx_limit - 8192) * 4
+
+            total_chars = 0
+            keep_idx = 0
+            # Always keep the system prompt
+            if engine.messages:
+                total_chars += len(engine.messages[0].get("content", ""))
+
+            # Count characters from newest to oldest
+            for i in range(len(engine.messages) - 1, 0, -1):
+                msg_len = len(engine.messages[i].get("content", ""))
+                if total_chars + msg_len > max_prompt_chars:
+                    keep_idx = i + 1
+                    break
+                total_chars += msg_len
+
+            if keep_idx > 1:
+                engine.messages = [engine.messages[0]] + engine.messages[keep_idx:]
 
             # Auto-save after each complete turn
             engine.save_game()
