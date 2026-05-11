@@ -94,6 +94,20 @@ class TestRPGEngine(unittest.TestCase):
             self.assertTrue(len(ge.messages) < 41)
             self.assertEqual(ge.messages[-1]["content"], "B" * 1000)
 
+    def test_context_trimming_huge_last_message(self):
+        """Test that context trimming keeps at least the last message even if it's huge."""
+        ge = GameEngine()
+        with patch.object(GameEngine, '_get_current_context_limit', return_value=1000):
+            # System prompt + one huge message
+            ge.messages = [
+                {"role": "system", "content": "SYSTEM"},
+                {"role": "user", "content": "A" * 5000},
+            ]
+            ge.trim_context()
+            # Should still keep the huge message (or at least not wipe it)
+            self.assertEqual(len(ge.messages), 2)
+            self.assertEqual(ge.messages[1]["content"], "A" * 5000)
+
     def test_error_response_not_saved(self):
         """Test that error responses from LLM are not added to history."""
         ge = GameEngine()
