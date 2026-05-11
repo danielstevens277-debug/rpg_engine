@@ -125,6 +125,29 @@ def _print_dm_response(response):
 
 
 # ---------------------------------------------------------------------------
+# Helper: filter history for player turns
+# ---------------------------------------------------------------------------
+
+def _filter_player_history(messages):
+    """
+    Rewrite conversation history for the player's turn.
+    DM messages (assistant) become user messages, and player messages (user)
+    become assistant messages. This ensures the LLM acting as the player
+    sees the DM's narration as the prompt.
+    """
+    rewritten = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        if role == "assistant":
+            rewritten.append({"role": "user", "content": m["content"]})
+        elif role == "user":
+            rewritten.append({"role": "assistant", "content": m["content"]})
+    return rewritten
+
+
+# ---------------------------------------------------------------------------
 # Streaming LLM caller for autoplay
 # ---------------------------------------------------------------------------
 # This is now handled by _call_llm from engine.py
@@ -457,7 +480,7 @@ def _sandbox_add_event(engine, description):
     messages = [
         {"role": "system", "content": _build_dm_prompt()},
     ]
-    messages.extend(engine.messages)
+    messages.extend(m for m in engine.messages if m.get("role") != "system")
     messages.append({
         "role": "user",
         "content": (
@@ -484,7 +507,7 @@ def _sandbox_add_event(engine, description):
     player_messages = [
         {"role": "system", "content": _build_player_prompt(engine)},
     ]
-    player_messages.extend(engine.messages)
+    player_messages.extend(_filter_player_history(engine.messages))
 
     player_response, player_reasoning, thinking_end, thinking_thread = _call_llm(
         player_messages, temperature=0.9, max_tokens=1024, stream=True
@@ -513,7 +536,7 @@ def _sandbox_remove_element(engine, description):
     messages = [
         {"role": "system", "content": _build_dm_prompt()},
     ]
-    messages.extend(engine.messages)
+    messages.extend(m for m in engine.messages if m.get("role") != "system")
     messages.append({
         "role": "user",
         "content": (
@@ -540,7 +563,7 @@ def _sandbox_remove_element(engine, description):
     player_messages = [
         {"role": "system", "content": _build_player_prompt(engine)},
     ]
-    player_messages.extend(engine.messages)
+    player_messages.extend(_filter_player_history(engine.messages))
 
     player_response, player_reasoning, thinking_end, thinking_thread = _call_llm(
         player_messages, temperature=0.9, max_tokens=1024, stream=True
@@ -573,7 +596,7 @@ def _sandbox_write_action(engine, action):
     messages = [
         {"role": "system", "content": _build_dm_prompt()},
     ]
-    messages.extend(engine.messages)
+    messages.extend(m for m in engine.messages if m.get("role") != "system")
 
     print(_c("  The Dungeon Master responds...", "dim"))
     dm_response, dm_reasoning, thinking_end, thinking_thread = _call_llm(
@@ -591,7 +614,7 @@ def _sandbox_write_action(engine, action):
     player_messages = [
         {"role": "system", "content": _build_player_prompt(engine)},
     ]
-    player_messages.extend(engine.messages)
+    player_messages.extend(_filter_player_history(engine.messages))
 
     player_response, player_reasoning, thinking_end, thinking_thread = _call_llm(
         player_messages, temperature=0.9, max_tokens=1024, stream=True
@@ -724,10 +747,12 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
                 print()
 
                 # Build player messages: system (identity) + conversation history
+                # Strip any existing system messages from history to avoid duplicates
+                # (the new system prompt is the authoritative one for this role)
                 player_messages = [
                     {"role": "system", "content": player_prompt},
                 ]
-                player_messages.extend(engine.messages)
+                player_messages.extend(_filter_player_history(engine.messages))
 
                 player_response, player_reasoning, thinking_end, thinking_thread = _call_llm(
                     player_messages, temperature=0.9, max_tokens=1024, stream=True
@@ -750,10 +775,13 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
             print()
 
             # Build DM messages: system + conversation history
+            # Strip existing system messages to avoid duplicates
             dm_messages = [
                 {"role": "system", "content": dm_prompt},
             ]
-            dm_messages.extend(engine.messages)
+            dm_messages.extend(
+                m for m in engine.messages if m.get("role") != "system"
+            )
 
             print(_c("  The Dungeon Master contemplates...", "dim"))
             dm_response, dm_reasoning, thinking_end, thinking_thread = _call_llm(
@@ -779,10 +807,11 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
             print()
 
             # Build player messages: system (identity) + conversation history
+            # Exclude last assistant message to avoid llama.cpp prefill bug with thinking
             player_messages = [
                 {"role": "system", "content": player_prompt},
             ]
-            player_messages.extend(engine.messages)
+            player_messages.extend(_filter_player_history(engine.messages))
 
             player_response, player_reasoning, thinking_end, thinking_thread = _call_llm(
                 player_messages, temperature=0.9, max_tokens=1024, stream=True
@@ -798,27 +827,7 @@ def autoplay_game_loop(engine, max_turns=50, sandbox=True):
 
 
             # Keep conversation manageable based on model context limit
-            ctx_limit = engine._get_current_context_limit()
-            # Estimate tokens: roughly 4 characters per token.
-            # Leave 8k tokens for system prompt and response.
-            max_prompt_chars = (ctx_limit - 8192) * 4
-
-            total_chars = 0
-            keep_idx = 0
-            # Always keep the system prompt
-            if engine.messages:
-                total_chars += len(engine.messages[0].get("content", ""))
-
-            # Count characters from newest to oldest
-            for i in range(len(engine.messages) - 1, 0, -1):
-                msg_len = len(engine.messages[i].get("content", ""))
-                if total_chars + msg_len > max_prompt_chars:
-                    keep_idx = i + 1
-                    break
-                total_chars += msg_len
-
-            if keep_idx > 1:
-                engine.messages = [engine.messages[0]] + engine.messages[keep_idx:]
+            engine.trim_context()
 
             # Auto-save after each complete turn
             engine.save_game()

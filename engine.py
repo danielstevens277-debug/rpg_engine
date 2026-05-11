@@ -158,8 +158,15 @@ def _stream_block_end(*colors):
 # LLM integration
 # ---------------------------------------------------------------------------
 
+# Global cache for API configuration and model metadata
+_CONFIG_CACHE = {}
+_CTX_CACHE = {}
+
 def _get_api_config():
-    """Read API configuration from environment variables."""
+    """Read API configuration from environment variables and cache it."""
+    if "config" in _CONFIG_CACHE:
+        return _CONFIG_CACHE["config"]
+
     provider = os.environ.get("RPG_LLM_PROVIDER", "openai")
     provider = provider.lower()
     api_key = os.environ.get("RPG_API_KEY", "") or os.environ.get(f"RPG_{provider.upper()}_API_KEY", "")
@@ -181,16 +188,22 @@ def _get_api_config():
     if not model:
         model = os.environ.get("RPG_OPENAI_MODEL", "gpt-4o-mini")
 
-    return {
+    config = {
         "provider": provider,
         "api_key": api_key,
         "base_url": base_url,
         "model": model,
     }
+    _CONFIG_CACHE["config"] = config
+    return config
 
 
 def _get_context_window(client, model_name):
-    """Query the API for the model's context length."""
+    """Query the API for the model's context length with caching."""
+    cache_key = f"openai:{model_name}"
+    if cache_key in _CTX_CACHE:
+        return _CTX_CACHE[cache_key]
+
     try:
         # Try to fetch model metadata
         model_info = client.models.retrieve(model=model_name)
@@ -200,7 +213,9 @@ def _get_context_window(client, model_name):
             if ctx:
                 break
         if ctx and isinstance(ctx, (int, float)) and ctx > 0:
-            return int(ctx)
+            res = int(ctx)
+            _CTX_CACHE[cache_key] = res
+            return res
     except Exception:
         pass
     # Fallback: use a reasonable default for modern models
@@ -336,8 +351,6 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
                 full_content += content
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception:
-        pass
     finally:
         _stop_thinking(thinking_end, thinking_thread)
 
@@ -349,7 +362,11 @@ def _stream_openai(client, kwargs, thinking_end, thinking_thread):
 
 
 def _get_anthropic_context_window(api_key, model_name, base_url=None):
-    """Query Anthropic API for the model's context length."""
+    """Query Anthropic API for the model's context length with caching."""
+    cache_key = f"anthropic:{model_name}"
+    if cache_key in _CTX_CACHE:
+        return _CTX_CACHE[cache_key]
+
     try:
         import httpx
         url = (base_url or "https://api.anthropic.com") + f"/v1/messages/models/{model_name}"
@@ -360,7 +377,9 @@ def _get_anthropic_context_window(api_key, model_name, base_url=None):
             for attr in ("context_window", "context_length", "max_input_tokens"):
                 ctx = data.get(attr)
                 if ctx and isinstance(ctx, (int, float)) and ctx > 0:
-                    return int(ctx)
+                    res = int(ctx)
+                    _CTX_CACHE[cache_key] = res
+                    return res
     except Exception:
         pass
     return 131072
@@ -518,8 +537,6 @@ def _stream_anthropic(client, system_msg, merged, temperature, max_tokens,
                     full_text += delta.text
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception:
-        pass
     finally:
         _stop_thinking(thinking_end, thinking_thread)
 
@@ -713,6 +730,45 @@ class GameEngine:
                 return _get_context_window(client, config["model"])
             except Exception:
                 return 131072
+
+    def trim_context(self):
+        """
+        Trim the conversation history to fit within the model's context window.
+        Always preserves the system prompt.
+        """
+        if not self.messages:
+            return
+
+        ctx_limit = self._get_current_context_limit()
+        # Estimate tokens: roughly 4 characters per token.
+        # Leave 8k tokens for system prompt and response.
+        max_prompt_chars = (ctx_limit - 8192) * 4
+
+        total_chars = 0
+        keep_idx = 0
+        
+        # Always keep the system prompt(s)
+        system_messages = []
+        non_system_messages = []
+        for m in self.messages:
+            if m.get("role") == "system":
+                system_messages.append(m)
+            else:
+                non_system_messages.append(m)
+        
+        for sm in system_messages:
+            total_chars += len(sm.get("content", ""))
+        
+        # Count characters from newest to oldest
+        for i in range(len(non_system_messages) - 1, -1, -1):
+            msg_len = len(non_system_messages[i].get("content", ""))
+            if total_chars + msg_len > max_prompt_chars:
+                keep_idx = i + 1
+                break
+            total_chars += msg_len
+        
+        if keep_idx < len(non_system_messages):
+            self.messages = system_messages + non_system_messages[keep_idx:]
 
     def load_game(self):
         """Load a saved game and restore conversation history."""
@@ -973,31 +1029,21 @@ class GameEngine:
                 self.save_game()
                 continue
 
+            # If the response indicates an error (e.g., connection lost), 
+            # don't add it to the conversation history.
+            if response and ("The connection to the Oracle has been lost" in response or 
+                              "The Oracle is speaking slowly" in response or 
+                              "The Oracle stumbles" in response):
+                print() # ensure a newline
+                continue
+
             self.messages.append({"role": "assistant", "content": response})
+
             if reasoning:
                 self.state["last_reasoning"] = reasoning
 
             # Keep messages manageable based on model context limit
-            ctx_limit = self._get_current_context_limit()
-            # Estimate tokens: roughly 4 characters per token. 
-            # Leave 8k tokens for system prompt and response.
-            max_prompt_chars = (ctx_limit - 8192) * 4
-            
-            total_chars = 0
-            keep_idx = 0
-            # Always keep the system prompt
-            total_chars += len(self.messages[0].get("content", ""))
-            
-            # Count characters from newest to oldest
-            for i in range(len(self.messages) - 1, 0, -1):
-                msg_len = len(self.messages[i].get("content", ""))
-                if total_chars + msg_len > max_prompt_chars:
-                    keep_idx = i + 1
-                    break
-                total_chars += msg_len
-            
-            if keep_idx > 1:
-                self.messages = [self.messages[0]] + self.messages[keep_idx:]
+            self.trim_context()
 
             print()
 
